@@ -29,5 +29,6 @@ import numpy as np
 # print(x[:, 0, 1, :])
 
 
-x = np.arange(16).reshape([4, 4])
-print(x)
+x = np.arange(5*2*7*3, dtype=float).reshape([5, 2, 7, 3])
+
+np.pad(x, [(0, 0), (1, 1), (1,1), (0, 0)])

@@ -2,7 +2,7 @@ import pickle
 import numpy as np
 import os
 from six.moves import cPickle as pickle
-from layers import Affine, ReLuActivation, ConvolutionNaive, Flatten
+from layers import Affine, ReLuActivation, ConvolutionBase, Flatten
 from losses import CrossEntropyLoss, SVMMax, SVM
 from initializers import UniformInitializer, HeInitializer, NormalInitializer
 from model import Model
@@ -60,15 +60,15 @@ if __name__ == '__main__':
     # X_tr = X_tr[:50, :]
     # y_tr = y_tr[:50, :]
     model = Model(verbose=True)
-    batch_size = 25
+    batch_size = 50
     n_classes = 10
     std = 0.01
     reg = 0.0
 
-    model.add_layer(ConvolutionNaive(32, (3, 3), input_shape=(batch_size, X_tr.shape[1], X_tr.shape[2], X_tr.shape[3]),
+    model.add_layer(ConvolutionBase(32, (3, 3), input_shape=(batch_size, X_tr.shape[1], X_tr.shape[2], X_tr.shape[3]),
                                      weight_initializer=NormalInitializer(std)))
     model.add_layer(ReLuActivation())
-    model.add_layer(ConvolutionNaive(32, (3, 3), weight_initializer=NormalInitializer(std)))
+    model.add_layer(ConvolutionBase(32, (3, 3), weight_initializer=NormalInitializer(std), padding='same'))
     model.add_layer(Flatten())
     model.add_layer(ReLuActivation())
 
