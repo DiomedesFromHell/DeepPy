@@ -14,7 +14,7 @@ def evaluate_gradient(f, X, df=None, eps=0.000001):
         X[idx] = x0 - eps
         f_left = f(X)
         diff = (f_right - f_left) / (2. * eps)
-        if df:
+        if df is not None:
             diff = df * diff
         grad[idx] = np.sum(diff)
         X[idx] = x0

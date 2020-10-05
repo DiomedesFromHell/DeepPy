@@ -7,7 +7,7 @@ from optimizers import GradientDescent
 
 class Model(object):
 
-    def __init__(self, batch_size=32, layers=[], optimizer=GradientDescent(), verbose=False, loss=None):
+    def __init__(self, batch_size=32, layers=[], optimizer=GradientDescent(), verbose=False, loss=None, seed=None):
         """
 
         :param batch_size: batch size, opt
@@ -23,6 +23,7 @@ class Model(object):
         self.loss = loss
         self.size = 0  # be careful, size can be correctly set only after initialize() call
         self.optimizer = optimizer
+        self.seed = seed
 
     def add_layer(self, layer):
         """
@@ -184,7 +185,7 @@ class Model(object):
         :param X: input observations.
         :return: predictions of shape (n_observations, d1, d2, ...)
         """
-        return self._forward(X)[1]
+        return self._forward(X, state='prediction')[1]
 
     def _process_batch(self, X, y, iteration=None):
         """
@@ -200,7 +201,7 @@ class Model(object):
         self._backward(loss_derivative, iteration=iteration, return_grads=False)
         return train_loss, train_preds
 
-    def _forward(self, X, y=None, compute_loss_grad=True):
+    def _forward(self, X, y=None, compute_loss_grad=True, state='training'):
         """
 
         Make a forward pass.
@@ -214,7 +215,7 @@ class Model(object):
             If y is None only predictions are not None.
         """
         for layer in self.layers:
-            X = layer.forward(layer_input=X)
+            X = layer.forward(layer_input=X, state=state, seed=self.seed)
 
         if y is None:
             if self.loss and self.loss.name == "CrossEntropy":

@@ -1,6 +1,10 @@
 import numpy as np
 from initializers import UniformInitializer
 from math_utils import softmax, sigmoid
+from utils.array_view import window_view
+import time
+
+EPS = 0.0000001
 
 
 # We always assume that final loss is a mean of the individual losses -
@@ -166,11 +170,13 @@ class ConvolutionBase(Layer):
             self.weights[-1, :] = self.bias_initializer.initialize()
 
     def forward(self, layer_input, *args, **kwargs):
+        t0 = time.time()
         batch_size = layer_input.shape[0]
 
         if self.padding == 'same':
             layer_input = self.pad_input_same(layer_input)
 
+        print('Padding takes: ', time.time() - t0)
         output = np.zeros(self._output_shape_for_batch(batch_size))
         i = 0
 
@@ -186,10 +192,11 @@ class ConvolutionBase(Layer):
             i += 1
 
         self.current_layer_input = layer_input
-
+        print('Naive forward takes: ', time.time() - t0)
         return output
 
     def backward(self, layer_error, *args, **kwargs):
+        t = time.time()
         dW = np.zeros_like(self.weights)
 
         if self.use_biases:
@@ -212,6 +219,7 @@ class ConvolutionBase(Layer):
                 dX[:, r1:r2, c1:c2, :] += np.einsum('bc, kldc->bkld', layer_error[:, i, j, :],
                                                     self.weights[:-1, :].reshape(patch_shape))
 
+        print('Naive backward takes: ', time.time() - t)
         return dW if self.use_biases else dW[:-1, :], dX[:, 1:-1, 1:-1, :] if self.padding == 'same' else dX
 
     @property
@@ -236,11 +244,151 @@ class ConvolutionBase(Layer):
 
 class Convolution(ConvolutionBase):
 
+    def _convolve(self, X, F, strides):
+        """
+
+        2d convolution, 3d window slides over 1st and 2nd dims of X (channels are summed up)
+
+        :param X: tensor to be convolved, expected shape is (batch, H, W, channels)
+        :param F: filter, expected shape is (n_filters, channels, h, w)
+        :param strides: sliding step in each direction
+        :return: matrix, result of convolution
+        """
+        X_w = window_view(X, strides, (F.shape[2], F.shape[3]), axes=(1, 2), as_contiguous=True)
+        output = np.tensordot(X_w, F, axes=((4, 5, 3), (2, 3, 0)))
+        return output
+
     def forward(self, layer_input, *args, **kwargs):
-        pass
+
+        t0 = time.time()
+        batch_size = layer_input.shape[0]
+        if self.padding == 'same':
+            layer_input = self.pad_input_same(layer_input)
+
+        print('Padding takes: ', time.time() - t0)
+
+        t = time.time()
+        X_w = window_view(layer_input, self.strides, self.filter_size, axes=(1, 2))
+        self.current_layer_input = X_w
+        # print('Window view takes: ', time.time() - t)
+        # t = time.time()
+        # X_w = X_w.reshape(
+        #     (batch_size, X_w.shape[1] * X_w.shape[2], -1))
+        # print('Reshape input takes: ', time.time() - t)
+        # t = time.time()
+        # W_sh = self.W.reshape((self.ch, self.ch_prev, self.filter_size[0], self.filter_size[1]))
+        # print('Filter reshape takes: ', time.time() - t)
+        t = time.time()
+        output = np.tensordot(X_w, self.W.reshape((self.ch, self.ch_prev, self.filter_size[0], self.filter_size[1])),
+                              axes=((4, 5, 3), (2, 3, 1)))
+        print('Tensor product takes: ', time.time() - t)
+        # output = np.einsum('bwhckf, dckf->bwhd', X_w, self.W.reshape((self.ch, self.ch_prev, self.filter_size[0], self.filter_size[1])))
+        # t = time.time()
+        # output = X_w.dot(self.W)
+        # print('Matrix product takes: ', time.time() - t)
+        if self.use_biases:
+            output += self.b
+        t = time.time()
+        output = output.reshape(self._output_shape_for_batch(batch_size))
+        print('Output reshape takes: ', time.time() - t)
+        print('Fast forward takes: ', time.time() - t0)
+        return output
 
     def backward(self, layer_error, *args, **kwargs):
-        pass
+        t0 = time.time()
+        dW = np.zeros_like(self.weights)
+
+        if self.use_biases:
+            dW[-1, :] = np.sum(layer_error, axis=(0, 1, 2))
+
+        batch_size, h_out, w_out, ch = layer_error.shape
+        t = time.time()
+        dW[:-1, :] = np.tensordot(layer_error, self.current_layer_input, axes=((0, 1, 2), (0, 1, 2))).reshape(-1,
+                                                                                                              self.ch)
+        # dW[:-1, :] = np.einsum('bwhd, bwhcij->ijcd', layer_error, self.current_layer_input).reshape(-1, self.ch)
+        print('Back dw einsum takes: ', time.time() - t)
+
+        W_rot180 = np.rot90(self.W.reshape((self.ch, self.ch_prev, self.filter_size[0], self.filter_size[1])),
+                            axes=(2, 3))
+        t = time.time()
+        sparse_error = np.zeros((batch_size, h_out * self.strides[0], w_out * self.strides[1], ch))
+        # sparse_error.as_st
+        # idx = np.meshgrid()
+        idx = np.ix_(np.arange(batch_size), self.strides[0] * np.arange(h_out), self.strides[1] * np.arange(w_out),
+                     np.arange(ch))
+        sparse_error[idx] = layer_error
+        del layer_error
+        print('build sparse takes: ', time.time() - t)
+        pad_width = (
+            (0, 0), (self.filter_size[0] - 1, self.filter_size[0] - 1),
+            (self.filter_size[1] - 1, self.filter_size[1] - 1),
+            (0, 0))
+        sparse_error = np.pad(sparse_error, pad_width)
+        t = time.time()
+        dX = self._convolve(sparse_error, W_rot180, (1, 1))
+        print('back conv takes: ', time.time() - t)
+        print('Fast backward takes: ', time.time() - t0)
+        return dW if self.use_biases else dW[:-1, :], dX[:, 1:-1, 1:-1, :] if self.padding == 'same' else dX
+
+
+class MaxPool(Layer):
+    layer_type = 'MaxPool'
+
+    def __init__(self, filter_size, input_shape=(None, None, None, None), name=''):
+        self.filter_size = filter_size
+        self.input_shape = input_shape
+        super(MaxPool, self).__init__(input_shape, name)
+        self.pad_w = 0
+        self.pad_h = 0
+        self.current_activation_map = None
+
+    def initialize_parameters(self):
+        rh, rw = self.input_shape[1] % self.filter_size[0], self.input_shape[2] % self.filter_size[1]
+        if rh != 0:
+            add_h = self.filter_size[0] - rh
+            add_h = add_h if add_h % 2 == 0 else add_h + 1
+            self.pad_h = add_h // 2
+        if rh != 0:
+            add_w = self.filter_size[1] - rw
+            add_w = add_w if add_w % 2 == 0 else add_w + 1
+            self.pad_w = add_w // 2
+
+    def forward(self, layer_input, *args, **kwargs):
+        pad_width = ((0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w), (0, 0))
+        layer_input = np.pad(layer_input, pad_width)
+
+        X_w = window_view(layer_input, steps=self.filter_size, window_size=self.filter_size, axes=(1, 2),
+                          as_contiguous=True)
+        output = np.amax(X_w, axis=(4, 5), keepdims=True)
+        self.current_activation_map = X_w != output
+
+        return output
+
+    def backward(self, layer_error, *args, **kwargs):
+        print('Maxpool back starts')
+        dX = np.repeat(layer_error, self.filter_size[0], axis=1)
+        dX = np.repeat(dX, self.filter_size[1], axis=2)
+        indices = np.where(self.current_activation_map)
+        print('Mask to row indices finished')
+        # print(indices.shape)
+        indices = list(indices)
+        indices[1] *= indices[-2]
+        indices[2] *= indices[-1]
+
+        print('Multiplying finished')
+        dX[indices[:-2]] = 0.
+        return None, dX[:, self.pad_h:dX.shape[1] - self.pad_h, self.pad_w:dX.shape[2] - self.pad_w, :]
+
+    @property
+    def output_shape(self):
+
+        h, rh = divmod(self.input_shape[1], self.filter_size[0])
+        w, rw = divmod(self.input_shape[2], self.filter_size[1])
+        if rh != 0:
+            h += 1
+        if rw != 0:
+            w += 1
+        return self.input_shape[0], h, w, self.input_shape[3]
 
 
 class Flatten(Layer):
@@ -344,103 +492,215 @@ class SoftmaxActivation(Layer):
         pass
 
 
-if __name__ == '__main__':
+class BatchNormalization(Layer):
+    layer_type = 'BatchNormalization'
+
+    def __init__(self, input_shape=None, name='', alpha=0.9):
+        super(BatchNormalization, self).__init__(input_shape, name)
+        self.weights = None
+        self.current_std = None
+        self.current_input_centr = None
+        self.variance = None
+        self.mean_tot = None
+        self.variance_tot = None
+        self.alpha = alpha
+
+    @property
+    def a(self):
+        return self.weights[0, :]
+
+    @property
+    def b(self):
+        return self.weights[1, :]
+
+    def initialize_parameters(self):
+        shape = [2]
+        shape += [self.input_shape[i] for i in range(1, len(self.input_shape))]
+        self.weights = np.ones(shape)
+
+    def forward(self, layer_input, *args, **kwargs):
+        state = kwargs.get('state', 'prediction')
+
+        batch_size = float(layer_input.shape[0])
+        if state == 'training':
+            mean_batch = np.sum(layer_input, axis=0, keepdims=True) / batch_size
+            self.current_input_centr = layer_input - mean_batch
+            var_batch = np.sum(self.current_input_centr ** 2, axis=0, keepdims=True) / batch_size
+            if self.mean_tot is None:
+                self.mean_tot = mean_batch
+            else:
+                self.mean_tot = self.alpha * self.mean_tot + (1 - self.alpha) * mean_batch
+            if self.variance_tot is None:
+                self.variance_tot = var_batch
+            else:
+                self.variance_tot = self.alpha * self.variance_tot + (1 - self.alpha) * var_batch
+
+            self.current_std = (var_batch + EPS) ** 0.5
+            return self.a * self.current_input_centr / self.current_std + self.b
+        if self.mean_tot is None or self.variance_tot is None:
+            mean_batch = np.sum(layer_input, axis=0, keepdims=True) / batch_size
+            curr_inp_centr = layer_input - mean_batch
+            var_batch = np.sum(curr_inp_centr ** 2, axis=0, keepdims=True) / batch_size
+            return self.a * curr_inp_centr / (var_batch + EPS) ** 0.5 + self.b
+
+        return self.a * (layer_input - self.mean_tot) / (self.variance_tot + EPS) ** 0.5 + self.b
+
+    def backward(self, layer_error, *args, **kwargs):
+        batch_size = layer_error.shape[0]
+        dx_tr = layer_error * self.a
+        dvar = np.sum(-0.5 * dx_tr * self.current_input_centr / self.current_std ** 3, axis=0, keepdims=True)
+        dmean = np.sum(-dx_tr / self.current_std, axis=0, keepdims=True) - 2 * dvar * np.sum(
+            self.current_input_centr, axis=0, keepdims=True) / batch_size
+        dx = dx_tr / self.current_std + (2 * dvar * self.current_input_centr + dmean) / batch_size
+        dweights = np.stack(
+            [np.sum(layer_error * self.current_input_centr / self.current_std, axis=0), np.sum(layer_error, axis=0)])
+        return dweights, dx
+
+    @property
+    def output_shape(self):
+        return self.input_shape
+
+    @property
+    def size(self):
+        if self.weights is None:
+            raise AttributeError(
+                "{}: weights should be initialized before calling size".format(self.__class__.__name__))
+        return self.weights.size
+
+
+class DropoutLayer(Layer):
+    layer_type = 'Droupout'
+
+    def __init__(self, input_shape=None, name='', drop_rate=0.3):
+        super(DropoutLayer, self).__init__(input_shape, name)
+        self.drop_rate = drop_rate
+        self.U = None
+
+    def forward(self, layer_input, *args, **kwargs):
+        state = kwargs.get('state', 'prediction')
+        if isinstance(kwargs['seed'], int):
+            np.random.seed(kwargs['seed'])
+        # self.U = np.ones_like(layer_input)
+        self.U = (1./1-self.drop_rate)*(np.random.rand(*layer_input.shape) >= self.drop_rate)
+        if state == 'prediction':
+            return layer_input
+        else:
+            return self.U*layer_input
+
+    def backward(self, layer_error, *args, **kwargs):
+        return None, layer_error*self.U
+
+    @property
+    def output_shape(self):
+        return self.input_shape
+
+    def initialize_parameters(self):
+        if len(self.input_shape) != 2:
+            raise AttributeError(
+                'Droupout should be used only for dense layers. Called with input_shape={}'.format(self.input_shape))
+
+
+def pad_input_same(X, filter_size, strides):
+    """
+
+    :param X: input data of shape (batch_size, height, width, n_channels)
+    :param filter_size: filter size of shape (filter_height, filter_width)
+    :param strides: step size for each of strided dimensions, which are height and width
+    :return: initial array padded with zeros, in a way that after sliding with a window of filter_size with
+        the given strides output shape will be the same as X.shape
+    """
+    input_shape = X.shape
+    pad_width = [(0, 0), ]
+    for i, stride in enumerate(strides):
+        delta = (input_shape[i + 1] - 1) * stride + filter_size[i] - input_shape[i + 1]
+        d = delta // 2 if delta % 2 == 0 else (delta + 1) // 2
+        pad_width.append((d, d))
+    pad_width.append((0, 0))
+    print(pad_width)
+    X_padded = np.pad(X, pad_width=pad_width)
+    return X_padded
+
+
+def check_batch_normalization():
     from utils.gradient_check import evaluate_gradient
     from math_utils import relative_error
-    from losses import CrossEntropyLoss
+    # means = [0.3, -4, 17]
+    # stds = [0.15, 2, 30]
+    # X = []
+    # d = 10000
+    # for i in range(3):
+    #     X.append(np.random.normal(means[i], stds[i], d))
+    # X = np.array(X).T
+    #
+    # means = np.array(means).reshape((1, 3))
+    # stds = np.array(stds).reshape((1, 3))
+    #
+    # layer = BatchNormalization(input_shape=(50, 3))
+    # layer.initialize_parameters()
+    # xs = X - np.mean(X, axis=0, keepdims=True)
+    # v = np.sum(xs ** 2, axis=0, keepdims=True) / d
+    # layer.weights[1, :] = np.zeros(3)
+    # out = layer.forward(X, mode='prediction')
+    #
+    # # print((X-means)/stds)
+    # # print(out)
+    # np.random.seed(231)
+    # N, D = 4, 5
+    # x = 5 * np.random.randn(N, D) + 12
+    # gamma = np.random.randn(D)
+    # beta = np.random.randn(D)
+    # w = np.vstack([beta, gamma])
+    # layer.weights = w
+    # print(w.shape)
+    #
+    # dout = np.random.randn(N, D)
+    #
+    # bn_param = {'mode': 'train'}
+    # fx = lambda x: layer.forward(x, state='training')
+    # # fg = lambda a: batchnorm_forward(x, a, beta, bn_param)[0]
+    # # fb = lambda b: batchnorm_forward(x, gamma, b, bn_param)[0]
+    #
+    # dx_num = evaluate_gradient(fx, x, dout)
+    # # da_num = eval_numerical_gradient_array(fg, gamma.copy(), dout)
+    # # db_num = eval_numerical_gradient_array(fb, beta.copy(), dout)
+    # # print(np.isclose(x-np.mean(x, axis=0, keepdims=True), layer.current_input_centr))
+    # dw, dx = layer.backward(dout)
+    # # You should expect to see relative errors between 1e-13 and 1e-8
+    # print(dx)
+    # print(dx_num)
+    # print('dx error: ', relative_error(dx_num, dx))
+    # # print('dgamma error: ', relative_error(da_num, dgamma))
+    # # print('dbeta error: ', relative_error(db_num, dbeta))
+    # np.random.seed(231)
+    # x = np.random.randn(500, 500) + 10
+    #
+    # for p in [0.25, 0.4, 0.7]:
+    #     dropout_layer = DropoutLayer(drop_rate=1-p)
+    #     out = dropout_layer.forward(x, state='training')
+    #     out_test = dropout_layer.forward(x, state='prediction')
+    #
+    #     print('Running tests with p = ', p)
+    #     print('Mean of input: ', x.mean())
+    #     print('Mean of train-time output: ', out.mean())
+    #     print('Mean of test-time output: ', out_test.mean())
+    #     print('Fraction of train-time output set to zero: ', (out == 0).mean())
+    #     print('Fraction of test-time output set to zero: ', (out_test == 0).mean())
+    #     print()
 
-    # # n_features = 2
-    # batch_size = 7
-    # c = 3
-    # in_shape = (batch_size, c)
-    # X = (np.random.random_sample(in_shape[0] * in_shape[1]) * 10 - 5).reshape(in_shape)
-    # y = np.random.randint(c, size=batch_size)
-    #
-    # loss = CrossEntropyLoss()
-    # relu_layer = ReLuActivation()
-    # X_inp = relu_layer.forward(X)
-    # _, _, d = loss.build(X_inp, y)
-    #
-    # grad = relu_layer.backward(d)[1]
-    #
-    # f = lambda x: loss.build(x, y, compute_derivative=False)[0]
-    # num_grad = evaluate_gradient(f, X_inp)
-    #
-    # err, _ = relative_error(grad, num_grad)
-    # assert err < 1e6
-    #
-    # n_features = 10
-    # batch_size = 5
-    # c = 5
-    # in_shape = (batch_size, n_features)
-    # X = (np.random.random_sample(in_shape[0] * in_shape[1]) * 10 - 5).reshape(in_shape)
-    # y = np.random.randint(c, size=batch_size)
-    #
-    # n_neurons = c
-    # aff_layer = Affine(n_neurons)
-    # W = (np.random.random_sample((n_features + 1) * n_neurons) * 10 - 5).reshape(n_features + 1, n_neurons)
-    # aff_layer.weights = W
-    #
-    # X_inp = aff_layer.forward(X)
-    # _, _, d = loss.build(X_inp, y)
-    # grad_W, grad_X = aff_layer.backward(d)
-    #
-    # fW = lambda w: loss.build(aff_layer.forward(X), y)[0]
-    # num_grad_W = evaluate_gradient(fW, aff_layer.weights)
-    #
-    # # print(grad_W)
-    # # print('------')
-    # # print(num_grad_W)
-    # err, idx = relative_error(grad_W, num_grad_W)
-    # print(err, grad_W[idx], num_grad_W[idx])
-    #
-    # fX = lambda x: loss.build(aff_layer.forward(X), y)[0]
-    # num_grad_X = evaluate_gradient(fX, X)
-    #
-    # # print(grad_X)
-    # # print('------')
-    # # print(num_grad_X)
-    # err, idx = relative_error(grad_X, num_grad_X)
-    # print(err, grad_X[idx], num_grad_X[idx])
+    np.random.seed(231)
+    x = np.random.randn(10, 10) + 10
+    dout = np.random.randn(*x.shape)
+    dropout_layer = DropoutLayer(drop_rate=0.8)
+    # dropout_param = {'mode': 'train', 'p': 0.2, 'seed': 123}
+    out = dropout_layer.forward(x, state='training', seed=123)
+    _, dx = dropout_layer.backward(dout)
+    dx_num = evaluate_gradient(lambda xx: dropout_layer.forward(xx, state='training', seed=123), x, dout)
 
-    h, w = 4, 4
-    f = 3
-    c = 3
-    b = 2
-    x_shape = (2, 3, 4, 4)
-    w_shape = (3, 3, 4, 4)
-    # x_shape = (b, h, w, c)
-    # w_shape = (h, w, c, f)
-    layer = ConvolutionNaive(f, (h, w), strides=2)
-    x = np.linspace(-0.1, 0.5, num=np.prod(x_shape)).reshape(x_shape)
-    x = np.transpose(x, [0, 2, 3, 1])
-    w = np.linspace(-0.2, 0.3, num=np.prod(w_shape)).reshape(w_shape)
-    w = np.transpose(w, [2, 3, 1, 0])
+    print(dx)
+    print(dx_num)
+    # Error should be around e-10 or less
+    print('dx relative error: ', relative_error(dx, dx_num))
 
-    b = np.linspace(-0.1, 0.2, num=3).reshape(1, -1)
-    w = w.reshape(-1, 3)
-    layer.weights = np.concatenate([w, b], axis=0)
-    conv_param = {'stride': 2, 'pad': 1}
-    # out, _ = conv_forward_naive(x, w, b, conv_param)
-    x_new = np.zeros((2, x.shape[1] + 2, x.shape[2] + 2, 3))
-    layer.input_shape = x_new.shape
-    x_new[:, 1:-1, 1:-1, :] = x
-    out = layer.forward(x_new)
-    print(out.shape)
-    correct_out = np.array([[[[-0.08759809, -0.10987781],
-                              [-0.18387192, -0.2109216]],
-                             [[0.21027089, 0.21661097],
-                              [0.22847626, 0.23004637]],
-                             [[0.50813986, 0.54309974],
-                              [0.64082444, 0.67101435]]],
-                            [[[-0.98053589, -1.03143541],
-                              [-1.19128892, -1.24695841]],
-                             [[0.69108355, 0.66880383],
-                              [0.59480972, 0.56776003]],
-                             [[2.36270298, 2.36904306],
-                              [2.38090835, 2.38247847]]]])
 
-    # Compare your output to ours; difference should be around e-8
-    print('Testing conv_forward_naive')
-    print(out)
-    # print('difference: ', rel_error(out, correct_out))
+if __name__ == '__main__':
+    check_batch_normalization()

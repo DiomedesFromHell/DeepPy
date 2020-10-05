@@ -2,8 +2,8 @@ import numpy as np
 from numpy.lib.stride_tricks import as_strided
 
 
-# first dimension batch, steps should correspond to X ndims
-def window_view(X, steps, window_size, axes=None):
+# first dimension is batch, steps should correspond to X ndims
+def window_view(X, steps, window_size, axes=None, as_contiguous=False):
     if axes is None and (X.ndim != len(steps) or X.ndim != len(window_size)):
         raise ValueError("window_view: steps and window_size len should equal to X.ndim or axes should be provided.")
     elif X.ndim != len(steps) or X.ndim != len(window_size):
@@ -25,4 +25,4 @@ def window_view(X, steps, window_size, axes=None):
     strides = base_strides + win_strides
     shape = base_shape + win_shape
 
-    return as_strided(X, shape, strides)
+    return np.ascontiguousarray(as_strided(X, shape, strides)) if as_contiguous else as_strided(X, shape, strides)

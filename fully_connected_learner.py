@@ -2,7 +2,7 @@ import pickle
 import numpy as np
 import os
 from six.moves import cPickle as pickle
-from layers import Affine, ReLuActivation, ConvolutionBase, Flatten
+from layers import Affine, ReLuActivation, ConvolutionBase, Flatten, Convolution, MaxPool, BatchNormalization, DropoutLayer
 from losses import CrossEntropyLoss, SVMMax, SVM
 from initializers import UniformInitializer, HeInitializer, NormalInitializer
 from model import Model
@@ -45,35 +45,33 @@ def load_CIFAR10(ds_root):
 if __name__ == '__main__':
     X_tr, y_tr, X_te, y_te = load_CIFAR10('/home/vaszac/PycharmProjects/cs231/assignment2/cifar-10-batches-py')
     print(X_tr.shape)
-    # X_tr = X_tr.reshape((X_tr.shape[0], -1))
-    # X_te = X_te.reshape((X_te.shape[0], -1))
-    # print(np.amax(X_tr))
     X_tr /= 255.
     X_te /= 255.
-    X_tr = X_tr[:50, :, :, :]
-    y_tr = y_tr[:50]
     mean = np.mean(X_tr, axis=0)
     X_tr -= mean
     X_te -= mean
     y_tr = y_tr.reshape((-1, 1))
     y_te = y_te.reshape((-1, 1))
-    # X_tr = X_tr[:50, :]
-    # y_tr = y_tr[:50, :]
+
     model = Model(verbose=True)
-    batch_size = 50
+    batch_size = 1024
     n_classes = 10
     std = 0.01
     reg = 0.0
 
-    model.add_layer(ConvolutionBase(32, (3, 3), input_shape=(batch_size, X_tr.shape[1], X_tr.shape[2], X_tr.shape[3]),
+    model.add_layer(Convolution(32, (3, 3), input_shape=(batch_size, X_tr.shape[1], X_tr.shape[2], X_tr.shape[3]),
                                      weight_initializer=NormalInitializer(std)))
     model.add_layer(ReLuActivation())
-    model.add_layer(ConvolutionBase(32, (3, 3), weight_initializer=NormalInitializer(std), padding='same'))
-    model.add_layer(Flatten())
+    model.add_layer(BatchNormalization())
+    model.add_layer(Convolution(32, (3, 3), weight_initializer=NormalInitializer(std), padding='same'))
+
     model.add_layer(ReLuActivation())
+    model.add_layer(MaxPool((2, 2)))
+    model.add_layer(Flatten())
 
     model.add_layer(Affine(100, weight_initializer=NormalInitializer(std), reg=reg))
     model.add_layer(ReLuActivation())
+    model.add_layer(DropoutLayer(drop_rate=0.3))
     model.add_layer(Affine(n_classes, weight_initializer=NormalInitializer(std), reg=reg))
 
     model.initialize(loss=CrossEntropyLoss(),
